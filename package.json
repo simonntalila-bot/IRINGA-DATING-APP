@@ -1,0 +1,25 @@
+{
+  "name": "iringa-dating",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Iringa Dating - location-aware dating app for Iringa city, villages and surrounding areas, Tanzania",
+  "workspaces": [
+    "backend"
+  ],
+  "scripts": {
+    "db:up": "docker compose up -d postgres redis",
+    "db:down": "docker compose down",
+    "install:mobile": "npm --prefix mobile install",
+    "backend": "npm run start:dev --workspace backend",
+    "mobile": "npm --prefix mobile run android",
+    "setup": "npm install && npm run install:mobile && npm run backend:setup",
+    "backend:setup": "npm run prisma:generate --workspace backend && npm run prisma:migrate --workspace backend && npm run prisma:seed --workspace backend",
+    "typecheck": "npm run typecheck --workspace backend && npm --prefix mobile run typecheck",
+    "test": "npm run test --workspace backend",
+    "lint": "npm run lint --workspace backend && npm --prefix mobile run lint",
+    "apk": "npm --prefix mobile run apk"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,39 @@
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.DS_Store
+
+# secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# editors
+.idea/
+.vscode/
+*.swp
+
+# mobile
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/build/
+mobile/android/local.properties
+mobile/android/.cxx/
+mobile/android/app/.cxx/
+mobile/android/.kotlin/
+mobile/ios/Pods/
+mobile/ios/build/
+*.keystore
+*.jks
+!debug.keystore
+mobile/android/keystore.properties
+mobile/android/app/google-services.json
+mobile/android/app/google-services-*.json
+mobile/vendor/
+mobile/node_modules/
+
+# docs lock files
+~$*

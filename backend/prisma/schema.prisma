@@ -1,0 +1,1620 @@
+// Iringa Dating - PostgreSQL schema
+//
+// Design notes
+// ------------
+// 1. Geography is DATA, never code. `SupportedRegion` + `LocationNode` (a
+//    self-referencing hierarchy: DISTRICT -> MUNICIPALITY -> WARD -> AREA ->
+//    VILLAGE -> STREET) + `LocationPlace` (dating spots, restaurants, cafes...)
+//    means new Iringa areas/villages/places can be added from the admin panel
+//    without a code change or a new APK.
+// 2. A user's real coordinates are stored in `UserLocation` (last known, server
+//    side only). They are NEVER serialised to another user. What other users
+//    receive is derived: area name + rounded distance, filtered through
+//    `UserLocationPreference.locationVisibility`.
+// 3. Media lives in Cloudflare R2. PostgreSQL only holds keys, URLs, mime type,
+//    size and duration.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  BANNED
+  DELETED
+}
+
+enum Gender {
+  FEMALE
+  MALE
+  OTHER
+  UNDISCLOSED
+}
+
+enum RelationshipGoal {
+  MARRIAGE
+  LONG_TERM
+  SERIOUS_DATING
+  SHORT_TERM
+  FRIENDSHIP
+}
+
+enum SmokingPreference {
+  NEVER
+  OCCASIONALLY
+  REGULARLY
+  PREFER_NOT_TO_SAY
+}
+
+enum DrinkingPreference {
+  NEVER
+  OCCASIONALLY
+  REGULARLY
+  PREFER_NOT_TO_SAY
+}
+
+enum ChildrenPreference {
+  YES
+  NO
+  MAYBE
+  PREFER_NOT_TO_SAY
+}
+
+enum SwipeType {
+  PASS
+  LIKE
+  SUPER_LIKE
+}
+
+enum MatchState {
+  ACTIVE
+  UNMATCHED
+}
+
+enum MessageKind {
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  FILE
+  SYSTEM
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+  AUDIO
+}
+
+enum LocationVisibility {
+  // Do not show any location at all
+  HIDDEN
+  // Show the approximate area name only (e.g. "Kihesa") - default
+  APPROXIMATE_AREA
+  // Show area name + rounded distance to matched users who also opted in
+  MATCHES_GENERAL_AREA
+}
+
+enum LocationKind {
+  DISTRICT
+  MUNICIPALITY
+  WARD
+  AREA
+  VILLAGE
+  STREET
+}
+
+enum PlaceCategorySlug {
+  DATING_SPOT
+  RESTAURANT
+  CAFE
+  ENTERTAINMENT
+  HOTEL
+  EVENT
+  OUTDOOR
+  FITNESS
+  CINEMA
+  SHOPPING
+  OTHER
+}
+
+enum NotificationType {
+  NEW_LIKE
+  NEW_SUPER_LIKE
+  NEW_MATCH
+  NEW_MESSAGE
+  VOICE_MESSAGE
+  STORY_REACTION
+  PROFILE_VIEW
+  DATE_INVITATION
+  DATE_REMINDER
+  DATE_SAFETY_REMINDER
+  AREA_ACTIVITY_MATCH
+  SUBSCRIPTION
+  BOOST_STARTED
+  BOOST_ENDED
+  SECURITY_ALERT
+  MODERATION
+}
+
+enum ReportReason {
+  FAKE_PROFILE
+  SCAM
+  HARASSMENT
+  SPAM
+  INAPPROPRIATE_CONTENT
+  UNDERAGE
+  THREAT
+  OFF_PLATFORM_SOLICITATION
+  // Safety reasons added for the adult dating model.
+  NON_CONSENSUAL_CONTENT
+  BLACKMAIL_EXTORTION
+  PROHIBITED_SEXUAL_SERVICES
+  TRAFFICKING_OR_COERCION
+  UNDERAGE_SEXUAL_CONTENT
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+enum VerificationType {
+  PHONE
+  EMAIL
+  PHOTO
+  SELFIE
+}
+
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum SubscriptionTier {
+  FREE
+  PREMIUM
+  VIP
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+/// What a payment is FOR. Keeps the payment engine generic so a new product can
+/// be sold without touching payment code.
+enum PaymentType {
+  CONTACT_UNLOCK
+  VIDEO_PURCHASE
+  PREMIUM_SUBSCRIPTION
+  BOOST
+  OTHER_PREMIUM_FEATURE
+}
+
+/// The purchasable products behind a payment.
+enum ProductType {
+  CONTACT_UNLOCK
+  PREMIUM_VIDEO
+  SUBSCRIPTION
+  BOOST
+}
+
+/// Central authorization ledger. Every protected feature asks
+/// EntitlementService, which reads these rows - nothing re-implements the rules.
+enum EntitlementType {
+  CONTACT_UNLOCK
+  VIDEO_PURCHASE
+  PREMIUM_SUBSCRIPTION
+  BOOST
+  FEATURE_FLAG
+  LOCATION_SHARE
+}
+
+enum ContactUnlockStatus {
+  ACTIVE
+  REFUNDED
+  REVOKED
+}
+
+enum VideoStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+  BANNED
+}
+
+enum LocationShareStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  REVOKED
+  EXPIRED
+}
+
+enum VideoPurchaseStatus {
+  ACTIVE
+  REFUNDED
+  REVOKED
+}
+
+// ---------------------------------------------------------------------------
+// Voice / video calls
+//
+// Signalling only: the media path is peer-to-peer WebRTC, so no audio or video
+// ever touches our servers. These rows hold the SDP/ICE handshake and the call
+// audit trail.
+// ---------------------------------------------------------------------------
+
+enum CallType {
+  VOICE
+  VIDEO
+}
+
+enum CallStatus {
+  RINGING
+  ACCEPTED
+  REJECTED
+  CANCELLED
+  MISSED
+  ENDED
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  ADMIN
+  MODERATOR
+  SUPPORT
+}
+
+enum StoryPrivacy {
+  PUBLIC
+  MATCHES_ONLY
+  HIDDEN
+}
+
+// ---------------------------------------------------------------------------
+// Identity & auth
+// ---------------------------------------------------------------------------
+
+model User {
+  id                String     @id @default(uuid()) @db.Uuid
+  // Phone numbers and WhatsApp numbers are never stored in clear text.
+  // `phoneHash` is a keyed HMAC used for lookups (login, OTP routing);
+  // `phoneEncrypted` / `whatsappEncrypted` are AES-256-GCM ciphertext.
+  phoneHash         String     @unique @map("phone_hash") @db.VarChar(64)
+  phoneEncrypted    String     @map("phone_encrypted") @db.Text
+  whatsappEncrypted String?    @map("whatsapp_encrypted") @db.Text
+  email             String?    @unique @db.VarChar(255)
+  passwordHash      String     @map("password_hash") @db.VarChar(120)
+  status            UserStatus @default(PENDING_VERIFICATION)
+  role              String     @default("user") @db.VarChar(32)
+  isAdmin           Boolean    @default(false) @map("is_admin")
+  lastSeenAt        DateTime?  @map("last_seen_at")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+  deletedAt         DateTime?  @map("deleted_at")
+
+  phoneVerifiedAt DateTime? @map("phone_verified_at")
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  ageConfirmedAt  DateTime? @map("age_confirmed_at")
+
+  profile                 Profile?
+  discoveryPreference     DiscoveryPreference?
+  privacySettings         UserPrivacySettings?
+  photos                  ProfilePhoto[]
+  videos                  ProfileVideo[]
+  interests               UserInterest[]
+  swipes                  Swipe[]
+  swipesReceived          Swipe[]               @relation("SwipeTarget")
+  matchesAsInitiator      Match[]               @relation("MatchInitiator")
+  matchesAsReceiver       Match[]               @relation("MatchReceiver")
+  conversationMemberships ConversationMember[]
+  messages                Message[]
+  messageReactions        MessageReaction[]
+  notifications           Notification[]
+  deviceTokens            DeviceToken[]
+  location                UserLocation?
+  locationEvents          UserLocationEvent[]
+  blocksMade              Block[]               @relation("Blocker")
+  blocksReceived          Block[]               @relation("Blocked")
+  reportsMade             Report[]              @relation("Reporter")
+  reportsAgainst          Report[]              @relation("ReportedUser")
+  verifications           Verification[]
+  stories                 Story[]
+  storyViews              StoryView[]
+  posts                   Post[]
+  postLikes               PostLike[]
+  postComments            PostComment[]
+  datePlansCreated        DatePlan[]            @relation("DatePlanCreator")
+  dateParticipations      DatePlanParticipant[]
+  dateCheckIns            DateCheckIn[]
+  safetyContacts          SafetyContact[]       @relation("SafetyContactOwner")
+  safetyContactOf         SafetyContact[]       @relation("SafetyContactTarget")
+  subscriptions           Subscription[]
+  payments                Payment[]
+  entitlements            Entitlement[]
+  boosts                  Boost[]
+  refreshTokens           RefreshToken[]
+  verificationCodes       VerificationCode[]
+  hiddenProfiles          ProfileHide[]         @relation("ProfileHideOwner")
+  hiddenBy                ProfileHide[]         @relation("ProfileHideTarget")
+  sessions                DeviceSession[]
+  reportedMedia           MediaModeration[]     @relation("ReportedMedia")
+  adminProfile            AdminUser?
+
+  // Contact unlock: who bought whose contact, and who was bought.
+  contactUnlocksBought    ContactUnlock[]           @relation("ContactBuyer")
+  contactUnlocksGranted   ContactUnlock[]           @relation("ContactOwner")
+  contactSharesOwned      LocationShare[]           @relation("LocationShareOwner")
+  contactSharesRequested  LocationShare[]           @relation("LocationShareRequester")
+  sharePermissionsGranted LocationSharePermission[] @relation("SharePermissionOwner")
+  sharePermissionsHeld    LocationSharePermission[] @relation("SharePermissionRecipient")
+  videoPurchases          VideoPurchase[]
+  sensitiveAccessLogs     SensitiveAccessLog[]
+  callsMade               CallSession[]             @relation("CallCaller")
+  callsReceived           CallSession[]             @relation("CallCallee")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash") @db.VarChar(120)
+  familyId  String    @map("family_id") @db.Uuid
+  userAgent String?   @map("user_agent") @db.VarChar(400)
+  ip        String?   @db.VarChar(64)
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  rotatedAt DateTime? @map("rotated_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+model DeviceSession {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  deviceId   String?   @map("device_id") @db.VarChar(120)
+  deviceName String?   @map("device_name") @db.VarChar(120)
+  platform   String?   @db.VarChar(32)
+  ip         String?   @db.VarChar(64)
+  userAgent  String?   @map("user_agent") @db.VarChar(400)
+  lastSeenAt DateTime  @default(now()) @map("last_seen_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  revokedAt  DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_sessions")
+}
+
+model VerificationCode {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String?   @map("user_id") @db.Uuid
+  target     String    @db.VarChar(255)
+  channel    String    @db.VarChar(16)
+  codeHash   String    @map("code_hash") @db.VarChar(120)
+  purpose    String    @db.VarChar(40)
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([target, purpose])
+  @@index([expiresAt])
+  @@map("verification_codes")
+}
+
+// ---------------------------------------------------------------------------
+// Profile
+// ---------------------------------------------------------------------------
+
+model Profile {
+  id                  String             @id @default(uuid()) @db.Uuid
+  userId              String             @unique @map("user_id") @db.Uuid
+  displayName         String             @map("display_name") @db.VarChar(60)
+  dateOfBirth         DateTime           @map("date_of_birth") @db.Date
+  gender              Gender
+  interestedIn        Gender[]           @map("interested_in")
+  relationshipGoal    RelationshipGoal   @map("relationship_goal")
+  bio                 String?            @db.VarChar(1000)
+  occupation          String?            @db.VarChar(120)
+  education           String?            @db.VarChar(160)
+  heightCm            Int?               @map("height_cm")
+  languages           String[]           @default([])
+  hobbies             String[]           @default([])
+  smoking             SmokingPreference  @default(PREFER_NOT_TO_SAY)
+  drinking            DrinkingPreference @default(PREFER_NOT_TO_SAY)
+  childrenPreference  ChildrenPreference @default(PREFER_NOT_TO_SAY) @map("children_preference")
+  // Discovery preferences
+  minAge              Int                @default(18) @map("min_age")
+  maxAge              Int                @default(99) @map("max_age")
+  maxDistanceKm       Int                @default(50) @map("max_distance_km")
+  // Displayed area. Never the raw GPS point.
+  displayedAreaNodeId String?            @map("displayed_area_node_id") @db.Uuid
+  lastActiveAt        DateTime?          @map("last_active_at")
+  profileCompletePct  Int                @default(0) @map("profile_complete_pct")
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  displayedAreaNode LocationNode?  @relation("DisplayedArea", fields: [displayedAreaNodeId], references: [id], onDelete: SetNull)
+  photos            ProfilePhoto[] @relation("ProfilePhotos")
+  videos            ProfileVideo[] @relation("ProfileVideos")
+  interestLinks     UserInterest[]
+
+  @@index([displayedAreaNodeId])
+  @@index([lastActiveAt])
+  @@map("profiles")
+}
+
+model ProfilePhoto {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  mediaId   String   @unique @map("media_id") @db.Uuid
+  position  Int      @default(0)
+  isPrimary Boolean  @default(false) @map("is_primary")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  media   Media   @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  profile Profile @relation("ProfilePhotos", fields: [userId], references: [userId], onDelete: Cascade, map: "profile_photos_profile_fkey")
+
+  @@index([userId, position])
+  @@map("profile_photos")
+}
+
+model ProfileVideo {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  mediaId   String   @unique @map("media_id") @db.Uuid
+  caption   String?  @db.VarChar(200)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  media   Media   @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  profile Profile @relation("ProfileVideos", fields: [userId], references: [userId], onDelete: Cascade, map: "profile_videos_profile_fkey")
+
+  @@index([userId])
+  @@map("profile_videos")
+}
+
+model Interest {
+  id       String  @id @default(uuid()) @db.Uuid
+  slug     String  @unique @db.VarChar(60)
+  labelEn  String  @map("label_en") @db.VarChar(80)
+  labelSw  String  @map("label_sw") @db.VarChar(80)
+  // Multi-codepoint emoji (family sequences, flags) exceed 16 UTF-16 units.
+  emoji    String? @db.VarChar(64)
+  category String? @db.VarChar(60)
+  isActive Boolean @default(true) @map("is_active")
+
+  users UserInterest[]
+
+  @@map("interests")
+}
+
+model UserInterest {
+  userId     String   @map("user_id") @db.Uuid
+  interestId String   @map("interest_id") @db.Uuid
+  profileId  String   @map("profile_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interest Interest @relation(fields: [interestId], references: [id], onDelete: Cascade)
+  profile  Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@id([userId, interestId])
+  @@index([profileId])
+  @@map("user_interests")
+}
+
+// ---------------------------------------------------------------------------
+// Geography: regions, hierarchy, places, geofences
+// ---------------------------------------------------------------------------
+
+model SupportedRegion {
+  id              String   @id @default(uuid()) @db.Uuid
+  slug            String   @unique @db.VarChar(60)
+  name            String   @db.VarChar(120)
+  countryCode     String   @map("country_code") @db.Char(2)
+  centerLat       Float    @map("center_lat")
+  centerLng       Float    @map("center_lng")
+  // GeoJSON Polygon (array of [lng, lat] rings) for the served boundary.
+  boundary        Json?
+  defaultRadiusKm Int      @default(50) @map("default_radius_km")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  nodes     LocationNode[]
+  places    LocationPlace[]
+  geofences Geofence[]
+
+  @@index([isActive])
+  @@map("supported_regions")
+}
+
+model LocationNode {
+  id          String       @id @default(uuid()) @db.Uuid
+  regionId    String       @map("region_id") @db.Uuid
+  parentId    String?      @map("parent_id") @db.Uuid
+  kind        LocationKind
+  name        String       @db.VarChar(120)
+  slug        String       @db.VarChar(140)
+  description String?      @db.VarChar(500)
+  centerLat   Float?       @map("center_lat")
+  centerLng   Float?       @map("center_lng")
+  // Radius in metres that this node "covers" - used when no polygon is defined.
+  radiusM     Int?         @map("radius_m")
+  // Optional GeoJSON Polygon boundary, admin supplied or verified.
+  boundary    Json?
+  isActive    Boolean      @default(true) @map("is_active")
+  sortOrder   Int          @default(0) @map("sort_order")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  region      SupportedRegion     @relation(fields: [regionId], references: [id], onDelete: Cascade)
+  parent      LocationNode?       @relation("NodeTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children    LocationNode[]      @relation("NodeTree")
+  displayedBy Profile[]           @relation("DisplayedArea")
+  geofences   Geofence[]
+  places      LocationPlace[]
+  usersHere   UserLocation[]
+  userEvents  UserLocationEvent[]
+
+  @@unique([regionId, slug])
+  @@index([regionId, kind, isActive])
+  @@index([parentId])
+  @@index([centerLat, centerLng])
+  @@map("location_nodes")
+}
+
+model PlaceCategory {
+  id           String            @id @default(uuid()) @db.Uuid
+  slug         PlaceCategorySlug @unique
+  labelEn      String            @map("label_en") @db.VarChar(80)
+  labelSw      String            @map("label_sw") @db.VarChar(80)
+  emoji        String?           @db.VarChar(64)
+  isDatingSpot Boolean           @default(false) @map("is_dating_spot")
+  isActive     Boolean           @default(true) @map("is_active")
+  sortOrder    Int               @default(0) @map("sort_order")
+
+  places LocationPlace[]
+
+  @@map("place_categories")
+}
+
+model LocationPlace {
+  id               String   @id @default(uuid()) @db.Uuid
+  regionId         String   @map("region_id") @db.Uuid
+  nodeId           String?  @map("node_id") @db.Uuid
+  categoryId       String   @map("category_id") @db.Uuid
+  name             String   @db.VarChar(160)
+  slug             String   @db.VarChar(180)
+  description      String?  @db.VarChar(1000)
+  address          String?  @db.VarChar(255)
+  latitude         Float
+  longitude        Float
+  // Geofence radius in metres (how close you must be to trigger an event)
+  radiusM          Int      @default(150) @map("radius_m")
+  // Human readable opening hours, e.g. { "mon": "08:00-22:00" }
+  openingHours     Json?    @map("opening_hours")
+  phone            String?  @db.VarChar(40)
+  website          String?  @db.VarChar(255)
+  isDatingFriendly Boolean  @default(false) @map("is_dating_friendly")
+  isActive         Boolean  @default(true) @map("is_active")
+  // True only when an admin confirmed the coordinates from a verified source.
+  isVerified       Boolean  @default(false) @map("is_verified")
+  sourceNote       String?  @map("source_note") @db.VarChar(255)
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  region    SupportedRegion @relation(fields: [regionId], references: [id], onDelete: Cascade)
+  node      LocationNode?   @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+  category  PlaceCategory   @relation(fields: [categoryId], references: [id])
+  photos    PlacePhoto[]
+  geofence  Geofence?
+  datePlans DatePlan[]
+
+  @@unique([regionId, slug])
+  @@index([categoryId, isActive])
+  @@index([latitude, longitude])
+  @@index([nodeId])
+  @@map("location_places")
+}
+
+model PlacePhoto {
+  id        String   @id @default(uuid()) @db.Uuid
+  placeId   String   @map("place_id") @db.Uuid
+  mediaId   String   @map("media_id") @db.Uuid
+  position  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  place LocationPlace @relation(fields: [placeId], references: [id], onDelete: Cascade)
+  media Media         @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+
+  @@index([placeId, position])
+  @@map("place_photos")
+}
+
+model Geofence {
+  id                String   @id @default(uuid()) @db.Uuid
+  regionId          String   @map("region_id") @db.Uuid
+  nodeId            String?  @map("node_id") @db.Uuid
+  placeId           String?  @unique @map("place_id") @db.Uuid
+  name              String   @db.VarChar(160)
+  latitude          Float
+  longitude         Float
+  radiusM           Int      @map("radius_m")
+  // Which audience may be told about an event here
+  notifyMatchesOnly Boolean  @default(true) @map("notify_matches_only")
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  region SupportedRegion @relation(fields: [regionId], references: [id], onDelete: Cascade)
+  node   LocationNode?   @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+  place  LocationPlace?  @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  events UserLocationEvent[]
+
+  @@index([regionId, isActive])
+  @@index([nodeId])
+  @@map("geofences")
+}
+
+// ---------------------------------------------------------------------------
+// User location (server side only) & privacy
+// ---------------------------------------------------------------------------
+
+model UserLocation {
+  userId                 String   @id @map("user_id") @db.Uuid
+  latitude               Float
+  longitude              Float
+  accuracyM              Int?     @map("accuracy_m")
+  areaNodeId             String?  @map("area_node_id") @db.Uuid
+  // Set while the user is outside the supported boundary. Account is NOT deleted.
+  outsideSupportedRegion Boolean  @default(false) @map("outside_supported_region")
+  source                 String   @default("gps") @db.VarChar(20)
+  recordedAt             DateTime @default(now()) @map("recorded_at")
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  areaNode LocationNode? @relation(fields: [areaNodeId], references: [id], onDelete: SetNull)
+
+  @@index([areaNodeId])
+  @@map("user_locations")
+}
+
+model UserPrivacySettings {
+  userId String @id @map("user_id") @db.Uuid
+
+  // --- Visibility of my own profile -------------------------------------
+  showMyProfile       Boolean @default(true) @map("show_my_profile")
+  showApproximateArea Boolean @default(true) @map("show_approximate_area")
+
+  // --- Contact consent ---------------------------------------------------
+  // The TZS 1,000 purchase buys access to an APPROVED contact feature.
+  // These flags are the profile owner's consent and are NEVER overridden by a
+  // payment: no consent => no disclosure, paid or not.
+  allowContactSharing   Boolean @default(false) @map("allow_contact_sharing")
+  allowWhatsAppSharing  Boolean @default(false) @map("allow_whatsapp_sharing")
+  allowCalls            Boolean @default(false) @map("allow_calls")
+  allowMessages         Boolean @default(true) @map("allow_messages")
+  allowLocationRequests Boolean @default(false) @map("allow_location_requests")
+  maxShareMinutes       Int     @default(30) @map("max_share_minutes")
+  showOnlineStatus      Boolean @default(true) @map("show_online_status")
+  showLastSeen          Boolean @default(true) @map("show_last_seen")
+  showProfileVideo      Boolean @default(true) @map("show_profile_video")
+
+  // --- Location privacy (kept from the previous design) -----------------
+  locationVisibility      LocationVisibility @default(APPROXIMATE_AREA) @map("location_visibility")
+  shareAreaWithMatches    Boolean            @default(false) @map("share_area_with_matches")
+  allowAreaActivityAlerts Boolean            @default(false) @map("allow_area_activity_alerts")
+  allowPlaceAlerts        Boolean            @default(false) @map("allow_place_alerts")
+  discoveryRadiusKm       Int                @default(50) @map("discovery_radius_km")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_privacy_settings")
+}
+
+model DiscoveryPreference {
+  userId           String            @id @map("user_id") @db.Uuid
+  preferredGender  Gender[]          @default([FEMALE]) @map("preferred_gender")
+  minAge           Int               @default(18) @map("min_age")
+  maxAge           Int               @default(60) @map("max_age")
+  maxDistanceKm    Int               @default(50) @map("max_distance_km")
+  relationshipGoal RelationshipGoal? @map("relationship_goal")
+  onlyVerified     Boolean           @default(false) @map("only_verified")
+  showOnlineFirst  Boolean           @default(false) @map("show_online_first")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([relationshipGoal])
+  @@map("discovery_preferences")
+}
+
+model UserLocationEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  geofenceId String?  @map("geofence_id") @db.Uuid
+  nodeId     String?  @map("node_id") @db.Uuid
+  areaName   String?  @map("area_name") @db.VarChar(120)
+  kind       String   @db.VarChar(32)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  geofence Geofence?     @relation(fields: [geofenceId], references: [id], onDelete: SetNull)
+  node     LocationNode? @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([nodeId, createdAt])
+  @@map("user_location_events")
+}
+
+// ---------------------------------------------------------------------------
+// Discovery, swipes, matches
+// ---------------------------------------------------------------------------
+
+model Swipe {
+  id        String    @id @default(uuid()) @db.Uuid
+  swiperId  String    @map("swiper_id") @db.Uuid
+  targetId  String    @map("target_id") @db.Uuid
+  type      SwipeType
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  swiper User @relation(fields: [swiperId], references: [id], onDelete: Cascade)
+  target User @relation("SwipeTarget", fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@unique([swiperId, targetId])
+  @@index([targetId, type])
+  @@index([swiperId, createdAt])
+  @@map("swipes")
+}
+
+model Match {
+  id                 String     @id @default(uuid()) @db.Uuid
+  userAId            String     @map("user_a_id") @db.Uuid
+  userBId            String     @map("user_b_id") @db.Uuid
+  initiatedBy        String     @map("initiated_by") @db.Uuid
+  state              MatchState @default(ACTIVE)
+  compatibilityScore Int        @map("compatibility_score")
+  lastMessageAt      DateTime?  @map("last_message_at")
+  createdAt          DateTime   @default(now()) @map("created_at")
+  endedAt            DateTime?  @map("ended_at")
+
+  userA        User               @relation("MatchInitiator", fields: [userAId], references: [id], onDelete: Cascade)
+  userB        User               @relation("MatchReceiver", fields: [userBId], references: [id], onDelete: Cascade)
+  participants MatchParticipant[]
+  conversation Conversation?
+
+  @@unique([userAId, userBId])
+  @@index([userAId, state])
+  @@index([userBId, state])
+  @@map("matches")
+}
+
+// Stored in canonical order (smaller uuid first) so the pair unique constraint
+// can never produce two matches for the same two users.
+model MatchParticipant {
+  matchId String @map("match_id") @db.Uuid
+  userId  String @map("user_id") @db.Uuid
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@id([matchId, userId])
+  @@map("match_participants")
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id        String   @id @default(uuid()) @db.Uuid
+  matchId   String   @unique @map("match_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  match      Match                   @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  members    ConversationMember[]
+  messages   Message[]
+  readStates ConversationReadState[]
+  datePlans  DatePlan[]
+
+  @@map("conversations")
+}
+
+model ConversationMember {
+  conversationId String    @map("conversation_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  joinedAt       DateTime  @default(now()) @map("joined_at")
+  leftAt         DateTime? @map("left_at")
+  isMuted        Boolean   @default(false) @map("is_muted")
+  isArchived     Boolean   @default(false) @map("is_archived")
+  isPinned       Boolean   @default(false) @map("is_pinned")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+  @@index([userId])
+  @@map("conversation_members")
+}
+
+model ConversationReadState {
+  conversationId String   @map("conversation_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  lastReadAt     DateTime @default(now()) @map("last_read_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+  @@map("conversation_read_states")
+}
+
+model Message {
+  id             String      @id @default(uuid()) @db.Uuid
+  conversationId String      @map("conversation_id") @db.Uuid
+  senderId       String      @map("sender_id") @db.Uuid
+  kind           MessageKind @default(TEXT)
+  body           String?     @db.Text
+  replyToId      String?     @map("reply_to_id") @db.Uuid
+  clientId       String?     @map("client_id") @db.VarChar(64)
+  durationSec    Int?        @map("duration_sec")
+  deletedAt      DateTime?   @map("deleted_at")
+  editedAt       DateTime?   @map("edited_at")
+  createdAt      DateTime    @default(now()) @map("created_at")
+
+  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User                @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  replyTo      Message?            @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies      Message[]           @relation("MessageReplies")
+  attachments  MessageAttachment[]
+  reactions    MessageReaction[]
+
+  @@unique([conversationId, clientId])
+  @@index([conversationId, createdAt])
+  @@index([senderId, createdAt])
+  @@map("messages")
+}
+
+model MessageAttachment {
+  id        String @id @default(uuid()) @db.Uuid
+  messageId String @map("message_id") @db.Uuid
+  mediaId   String @map("media_id") @db.Uuid
+  position  Int    @default(0)
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  media   Media   @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@map("message_attachments")
+}
+
+model MessageReaction {
+  messageId String   @map("message_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  emoji     String   @db.VarChar(16)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([messageId, userId, emoji])
+  @@map("message_reactions")
+}
+
+// ---------------------------------------------------------------------------
+// Media (Cloudflare R2 objects, metadata in Postgres)
+// ---------------------------------------------------------------------------
+
+model Media {
+  id          String    @id @default(uuid()) @db.Uuid
+  ownerId     String    @map("owner_id") @db.Uuid
+  type        MediaType
+  storageKey  String    @unique @map("storage_key") @db.VarChar(400)
+  bucket      String    @db.VarChar(80)
+  mimeType    String    @map("mime_type") @db.VarChar(120)
+  sizeBytes   Int       @map("size_bytes")
+  width       Int?
+  height      Int?
+  durationSec Int?      @map("duration_sec")
+  checksum    String?   @db.VarChar(128)
+  status      String    @default("ready") @db.VarChar(20)
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  profilePhotos ProfilePhoto[]
+  profileVideos ProfileVideo[]
+  placePhotos   PlacePhoto[]
+  attachments   MessageAttachment[]
+  storyItems    Story[]
+  postMedia     PostMedia[]
+  moderation    MediaModeration[]
+
+  @@index([ownerId, type])
+  @@map("media")
+}
+
+model MediaModeration {
+  id         String       @id @default(uuid()) @db.Uuid
+  mediaId    String       @map("media_id") @db.Uuid
+  reporterId String?      @map("reporter_id") @db.Uuid
+  status     ReportStatus @default(OPEN)
+  note       String?      @db.VarChar(500)
+  createdAt  DateTime     @default(now()) @map("created_at")
+  resolvedAt DateTime?    @map("resolved_at")
+
+  media    Media @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  reporter User? @relation("ReportedMedia", fields: [reporterId], references: [id], onDelete: SetNull)
+
+  @@index([mediaId, status])
+  @@map("media_moderation")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  type      NotificationType
+  title     String           @db.VarChar(160)
+  body      String           @db.VarChar(500)
+  data      Json?
+  isRead    Boolean          @default(false) @map("is_read")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model DeviceToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  token     String   @unique @db.VarChar(400)
+  platform  String   @db.VarChar(20)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Blocks, reports, verification
+// ---------------------------------------------------------------------------
+
+model Block {
+  id        String   @id @default(uuid()) @db.Uuid
+  blockerId String   @map("blocker_id") @db.Uuid
+  blockedId String   @map("blocked_id") @db.Uuid
+  reason    String?  @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  blocker User @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
+  @@map("blocks")
+}
+
+model ProfileHide {
+  id        String   @id @default(uuid()) @db.Uuid
+  ownerId   String   @map("owner_id") @db.Uuid
+  targetId  String   @map("target_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  owner  User @relation("ProfileHideOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  target User @relation("ProfileHideTarget", fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@unique([ownerId, targetId])
+  @@map("profile_hides")
+}
+
+model Report {
+  id             String       @id @default(uuid()) @db.Uuid
+  reporterId     String       @map("reporter_id") @db.Uuid
+  reportedUserId String?      @map("reported_user_id") @db.Uuid
+  reportedPostId String?      @map("reported_post_id") @db.Uuid
+  reason         ReportReason
+  details        String?      @db.VarChar(1000)
+  evidence       Json?
+  status         ReportStatus @default(OPEN)
+  createdAt      DateTime     @default(now()) @map("created_at")
+  resolvedAt     DateTime?    @map("resolved_at")
+  resolvedById   String?      @map("resolved_by_id") @db.Uuid
+
+  reporter     User  @relation("Reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  reportedUser User? @relation("ReportedUser", fields: [reportedUserId], references: [id], onDelete: SetNull)
+  reportedPost Post? @relation("ReportedPost", fields: [reportedPostId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([reportedUserId])
+  @@map("reports")
+}
+
+model Verification {
+  id         String             @id @default(uuid()) @db.Uuid
+  userId     String             @map("user_id") @db.Uuid
+  type       VerificationType
+  status     VerificationStatus @default(PENDING)
+  // Public handle used in the share URL, never the internal uuid.
+  publicId   String             @unique @map("public_id") @db.VarChar(40)
+  reviewedBy String?            @map("reviewed_by") @db.Uuid
+  reviewNote String?            @map("review_note") @db.VarChar(500)
+  createdAt  DateTime           @default(now()) @map("created_at")
+  reviewedAt DateTime?          @map("reviewed_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type])
+  @@index([status, type])
+  @@map("verifications")
+}
+
+// ---------------------------------------------------------------------------
+// Stories & posts
+// ---------------------------------------------------------------------------
+
+model Story {
+  id        String       @id @default(uuid()) @db.Uuid
+  userId    String       @map("user_id") @db.Uuid
+  mediaId   String?      @map("media_id") @db.Uuid
+  textBody  String?      @map("text_body") @db.VarChar(500)
+  privacy   StoryPrivacy @default(PUBLIC)
+  expiresAt DateTime     @map("expires_at")
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  user  User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  media Media?      @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  views StoryView[]
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+  @@map("stories")
+}
+
+model StoryView {
+  storyId  String   @map("story_id") @db.Uuid
+  viewerId String   @map("viewer_id") @db.Uuid
+  viewedAt DateTime @default(now()) @map("viewed_at")
+
+  story  Story @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  viewer User  @relation(fields: [viewerId], references: [id], onDelete: Cascade)
+
+  @@id([storyId, viewerId])
+  @@map("story_views")
+}
+
+model Post {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  caption   String?   @db.VarChar(1000)
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  media    PostMedia[]
+  likes    PostLike[]
+  comments PostComment[]
+  reports  Report[]      @relation("ReportedPost")
+
+  @@index([userId, createdAt])
+  @@map("posts")
+}
+
+model PostMedia {
+  id       String @id @default(uuid()) @db.Uuid
+  postId   String @map("post_id") @db.Uuid
+  mediaId  String @map("media_id") @db.Uuid
+  position Int    @default(0)
+
+  post  Post  @relation(fields: [postId], references: [id], onDelete: Cascade)
+  media Media @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+
+  @@index([postId, position])
+  @@map("post_media")
+}
+
+model PostLike {
+  postId    String   @map("post_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@map("post_likes")
+}
+
+model PostComment {
+  id        String   @id @default(uuid()) @db.Uuid
+  postId    String   @map("post_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  body      String   @db.VarChar(500)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@map("post_comments")
+}
+
+// ---------------------------------------------------------------------------
+// Dates & safety
+// ---------------------------------------------------------------------------
+
+model DatePlan {
+  id             String   @id @default(uuid()) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  createdById    String   @map("created_by_id") @db.Uuid
+  placeId        String?  @map("place_id") @db.Uuid
+  placeName      String   @map("place_name") @db.VarChar(160)
+  placeLat       Float?   @map("place_lat")
+  placeLng       Float?   @map("place_lng")
+  scheduledFor   DateTime @map("scheduled_for")
+  note           String?  @db.VarChar(500)
+  status         String   @default("PENDING") @db.VarChar(20)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  conversation   Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  createdBy      User                  @relation("DatePlanCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  place          LocationPlace?        @relation(fields: [placeId], references: [id], onDelete: SetNull)
+  participants   DatePlanParticipant[]
+  checkIns       DateCheckIn[]
+  safetyContacts SafetyContact[]
+
+  @@index([conversationId, scheduledFor])
+  @@map("date_plans")
+}
+
+model DatePlanParticipant {
+  datePlanId String    @map("date_plan_id") @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  acceptedAt DateTime? @map("accepted_at")
+
+  datePlan DatePlan @relation(fields: [datePlanId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([datePlanId, userId])
+  @@map("date_plan_participants")
+}
+
+model DateCheckIn {
+  id         String   @id @default(uuid()) @db.Uuid
+  datePlanId String   @map("date_plan_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  type       String   @db.VarChar(16)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  datePlan DatePlan @relation(fields: [datePlanId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([datePlanId, type])
+  @@map("date_check_ins")
+}
+
+// Safety contact chosen by the user. The app never shares GPS automatically:
+// check-ins are reminders, and the trusted contact is only notified if the
+// user enabled it and the date is overdue.
+model SafetyContact {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  contactUserId   String?  @map("contact_user_id") @db.Uuid
+  name            String   @db.VarChar(120)
+  phone           String   @db.VarChar(40)
+  isPrimary       Boolean  @default(false) @map("is_primary")
+  notifyOnOverdue Boolean  @default(true) @map("notify_on_overdue")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  user        User       @relation("SafetyContactOwner", fields: [userId], references: [id], onDelete: Cascade)
+  contactUser User?      @relation("SafetyContactTarget", fields: [contactUserId], references: [id], onDelete: SetNull)
+  datePlans   DatePlan[]
+
+  @@index([userId])
+  @@map("safety_contacts")
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions, payments, boosts
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id                 String             @id @default(uuid()) @db.Uuid
+  userId             String             @map("user_id") @db.Uuid
+  tier               SubscriptionTier   @default(FREE)
+  status             SubscriptionStatus @default(ACTIVE)
+  provider           String?            @db.VarChar(40)
+  providerRef        String?            @map("provider_ref") @db.VarChar(160)
+  currentPeriodStart DateTime           @map("current_period_start")
+  currentPeriodEnd   DateTime           @map("current_period_end")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  cancelledAt        DateTime?          @map("cancelled_at")
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentItem PaymentItem?
+
+  @@index([userId, status])
+  @@map("subscriptions")
+}
+
+model Payment {
+  id             String        @id @default(uuid()) @db.Uuid
+  userId         String        @map("user_id") @db.Uuid
+  type           PaymentType
+  provider       String        @db.VarChar(40)
+  providerRef    String?       @unique @map("provider_ref") @db.VarChar(160)
+  providerTxId   String?       @map("provider_tx_id") @db.VarChar(160)
+  idempotencyKey String        @unique @map("idempotency_key") @db.VarChar(80)
+  amountMinor    Int           @map("amount_minor")
+  currency       String        @default("TZS") @db.Char(3)
+  status         PaymentStatus @default(PENDING)
+  failureReason  String?       @map("failure_reason") @db.VarChar(255)
+  metadata       Json?
+  paidAt         DateTime?     @map("paid_at")
+  refundedAt     DateTime?     @map("refunded_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  user  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items PaymentItem[]
+
+  @@index([userId, status, createdAt])
+  @@index([type, status])
+  @@map("payments")
+}
+
+/// What a payment bought. One payment can contain several items, and each item
+/// is granted its own entitlement. This is the join that makes "one payment =
+/// one contact unlock" enforceable.
+model PaymentItem {
+  id          String        @id @default(uuid()) @db.Uuid
+  paymentId   String        @map("payment_id") @db.Uuid
+  productType ProductType   @map("product_type")
+  productId   String?       @map("product_id") @db.VarChar(64)
+  amountMinor Int           @map("amount_minor")
+  currency    String        @default("TZS") @db.Char(3)
+  status      PaymentStatus @default(PENDING)
+  deliveredAt DateTime?     @map("delivered_at")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  payment        Payment        @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  contactUnlock  ContactUnlock?
+  videoPurchase  VideoPurchase?
+  subscriptionId String?        @unique @map("subscription_id") @db.Uuid
+  subscription   Subscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  boostId        String?        @unique @map("boost_id") @db.Uuid
+  boost          Boost?         @relation(fields: [boostId], references: [id], onDelete: SetNull)
+  entitlement    Entitlement?
+
+  @@index([paymentId])
+  @@index([productType, productId])
+  @@map("payment_items")
+}
+
+model Boost {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  minutes       Int      @default(30)
+  startedAt     DateTime @default(now()) @map("started_at")
+  endsAt        DateTime @map("ends_at")
+  impressions   Int      @default(0)
+  profileVisits Int      @default(0) @map("profile_visits")
+  likesReceived Int      @default(0) @map("likes_received")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentItem PaymentItem?
+
+  @@index([userId, endsAt])
+  @@map("boosts")
+}
+
+// ---------------------------------------------------------------------------
+// Monetisation: contact unlock + premium media
+//
+// SAFETY MODEL (business rules 2, 3, 4, 5, 14)
+//   A payment buys access to an APPROVED contact feature. It never buys a
+//   person, never overrides the owner's consent, and the product itself may not
+//   be used to advertise paid sexual services (enforced by the content policy
+//   checks + report reasons + moderation).
+// ---------------------------------------------------------------------------
+
+model ContactUnlock {
+  id               String              @id @default(uuid()) @db.Uuid
+  buyerId          String              @map("buyer_id") @db.Uuid
+  profileOwnerId   String              @map("profile_owner_id") @db.Uuid
+  paymentItemId    String              @unique @map("payment_item_id") @db.Uuid
+  amountMinor      Int                 @map("amount_minor")
+  currency         String              @default("TZS") @db.Char(3)
+  status           ContactUnlockStatus @default(ACTIVE)
+  phoneUnlocked    Boolean             @default(true) @map("phone_unlocked")
+  whatsappUnlocked Boolean             @default(false) @map("whatsapp_unlocked")
+  refundedAt       DateTime?           @map("refunded_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+  expiresAt        DateTime?           @map("expires_at")
+
+  buyer        User        @relation("ContactBuyer", fields: [buyerId], references: [id], onDelete: Cascade)
+  profileOwner User        @relation("ContactOwner", fields: [profileOwnerId], references: [id], onDelete: Cascade)
+  paymentItem  PaymentItem @relation(fields: [paymentItemId], references: [id], onDelete: Cascade)
+
+  /// One buyer pays once per target profile. This constraint is what makes
+  /// "already unlocked -> do not charge again" a database guarantee rather
+  /// than an application check that can be forgotten.
+  @@unique([buyerId, profileOwnerId])
+  @@index([profileOwnerId, status])
+  @@map("contact_unlocks")
+}
+
+model VideoCategory {
+  id        String  @id @default(uuid()) @db.Uuid
+  slug      String  @unique @db.VarChar(60)
+  labelEn   String  @map("label_en") @db.VarChar(80)
+  labelSw   String  @map("label_sw") @db.VarChar(80)
+  emoji     String? @db.VarChar(64)
+  isAdult   Boolean @default(true) @map("is_adult")
+  isActive  Boolean @default(true) @map("is_active")
+  sortOrder Int     @default(0) @map("sort_order")
+
+  videos PremiumVideo[]
+
+  @@map("video_categories")
+}
+
+model PremiumVideo {
+  id             String      @id @default(uuid()) @db.Uuid
+  title          String      @db.VarChar(160)
+  description    String?     @db.VarChar(1000)
+  categoryId     String      @map("category_id") @db.Uuid
+  thumbnailKey   String?     @map("thumbnail_key") @db.VarChar(400)
+  videoKey       String      @map("video_key") @db.VarChar(400)
+  bucket         String      @db.VarChar(80)
+  durationSec    Int?        @map("duration_sec")
+  sizeBytes      Int?        @map("size_bytes")
+  mimeType       String      @default("video/mp4") @map("mime_type") @db.VarChar(120)
+  priceMinor     Int         @default(100000) @map("price_minor")
+  currency       String      @default("TZS") @db.Char(3)
+  isPremium      Boolean     @default(true) @map("is_premium")
+  status         VideoStatus @default(DRAFT)
+  /// Set by moderation when the video is pulled for policy violations.
+  moderationNote String?     @map("moderation_note") @db.VarChar(500)
+  publishedAt    DateTime?   @map("published_at")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  category  VideoCategory   @relation(fields: [categoryId], references: [id])
+  purchases VideoPurchase[]
+
+  @@index([status, categoryId])
+  @@index([isPremium])
+  @@map("premium_videos")
+}
+
+model VideoPurchase {
+  id            String              @id @default(uuid()) @db.Uuid
+  userId        String              @map("user_id") @db.Uuid
+  videoId       String              @map("video_id") @db.Uuid
+  paymentItemId String              @unique @map("payment_item_id") @db.Uuid
+  amountMinor   Int                 @map("amount_minor")
+  currency      String              @default("TZS") @db.Char(3)
+  status        VideoPurchaseStatus @default(ACTIVE)
+  refundedAt    DateTime?           @map("refunded_at")
+  createdAt     DateTime            @default(now()) @map("created_at")
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  video       PremiumVideo @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  paymentItem PaymentItem  @relation(fields: [paymentItemId], references: [id], onDelete: Cascade)
+
+  /// Same rule as contact unlock: buying twice is impossible at the database level.
+  @@unique([userId, videoId])
+  @@index([videoId, status])
+  @@map("video_purchases")
+}
+
+model Entitlement {
+  id            String          @id @default(uuid()) @db.Uuid
+  userId        String          @map("user_id") @db.Uuid
+  type          EntitlementType
+  /// Target of the entitlement: profile owner id, video id, plan id...
+  resourceId    String?         @map("resource_id") @db.VarChar(64)
+  paymentItemId String?         @unique @map("payment_item_id") @db.Uuid
+  startsAt      DateTime        @default(now()) @map("starts_at")
+  expiresAt     DateTime?       @map("expires_at")
+  revokedAt     DateTime?       @map("revoked_at")
+  revokedReason String?         @map("revoked_reason") @db.VarChar(255)
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentItem PaymentItem? @relation(fields: [paymentItemId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, type, resourceId])
+  @@index([userId, type])
+  @@map("entitlements")
+}
+
+// ---------------------------------------------------------------------------
+// Live location sharing - consent driven, never automatic
+// ---------------------------------------------------------------------------
+
+/// A request for temporary live location. Payment does NOT create this: the
+/// requester asks, and the profile owner decides.
+model LocationShare {
+  id               String              @id @default(uuid()) @db.Uuid
+  ownerId          String              @map("owner_id") @db.Uuid
+  requesterId      String              @map("requester_id") @db.Uuid
+  status           LocationShareStatus @default(PENDING)
+  requestedMinutes Int                 @map("requested_minutes")
+  note             String?             @db.VarChar(255)
+  decidedAt        DateTime?           @map("decided_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+
+  owner      User                     @relation("LocationShareOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  requester  User                     @relation("LocationShareRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  permission LocationSharePermission?
+
+  @@unique([ownerId, requesterId])
+  @@index([requesterId, status])
+  @@map("location_shares")
+}
+
+/// The active grant produced by accepting a LocationShare. This row is what
+/// the recipient's device reads, and it carries its own hard expiry.
+model LocationSharePermission {
+  id          String    @id @default(uuid()) @db.Uuid
+  shareId     String    @unique @map("share_id") @db.Uuid
+  ownerId     String    @map("owner_id") @db.Uuid
+  recipientId String    @map("recipient_id") @db.Uuid
+  grantedAt   DateTime  @default(now()) @map("granted_at")
+  expiresAt   DateTime  @map("expires_at")
+  endedAt     DateTime? @map("ended_at")
+  endReason   String?   @map("end_reason") @db.VarChar(120)
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  share     LocationShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  owner     User          @relation("SharePermissionOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  recipient User          @relation("SharePermissionRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId, endedAt])
+  @@index([expiresAt])
+  @@map("location_share_permissions")
+}
+
+// ---------------------------------------------------------------------------
+// Audited access to sensitive data
+// ---------------------------------------------------------------------------
+
+/// Written whenever an admin (or the owner) reads contact data, and whenever a
+/// contact/video entitlement is granted or revoked.
+model SensitiveAccessLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @map("actor_id") @db.Uuid
+  actorRole String?  @map("actor_role") @db.VarChar(40)
+  subjectId String?  @map("subject_id") @db.Uuid
+  action    String   @db.VarChar(80)
+  reason    String?  @db.VarChar(255)
+  ip        String?  @db.VarChar(64)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId, createdAt])
+  @@index([subjectId, createdAt])
+  @@map("sensitive_access_logs")
+}
+
+/// One call attempt. Media flows peer-to-peer over WebRTC; we only keep the
+/// signalling handshake and an audit trail of who called whom, so the app can
+/// offer "Block/report during call" without recording any content.
+model CallSession {
+  id             String     @id @default(uuid()) @db.Uuid
+  callerId       String     @map("caller_id") @db.Uuid
+  calleeId       String     @map("callee_id") @db.Uuid
+  conversationId String?    @map("conversation_id") @db.Uuid
+  type           CallType   @default(VOICE)
+  status         CallStatus @default(RINGING)
+  sdpOffer       String?    @map("sdp_offer") @db.Text
+  sdpAnswer      String?    @map("sdp_answer") @db.Text
+  /// Accumulated ICE candidates, kept so a reconnecting peer can resume.
+  iceCandidates  Json?      @map("ice_candidates")
+  ringTimeoutAt  DateTime   @map("ring_timeout_at")
+  acceptedAt     DateTime?  @map("accepted_at")
+  endedAt        DateTime?  @map("ended_at")
+  endReason      String?    @map("end_reason") @db.VarChar(120)
+  createdAt      DateTime   @default(now()) @map("created_at")
+
+  caller User @relation("CallCaller", fields: [callerId], references: [id], onDelete: Cascade)
+  callee User @relation("CallCallee", fields: [calleeId], references: [id], onDelete: Cascade)
+
+  @@index([callerId, createdAt])
+  @@index([calleeId, createdAt])
+  @@index([status, ringTimeoutAt])
+  @@map("call_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+
+model AdminUser {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String?   @unique @map("user_id") @db.Uuid
+  email        String    @unique @db.VarChar(255)
+  passwordHash String    @map("password_hash") @db.VarChar(120)
+  role         AdminRole @default(SUPPORT)
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  logs AdminLog[]
+
+  @@map("admin_users")
+}
+
+model AdminLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  adminId    String?  @map("admin_id") @db.Uuid
+  action     String   @db.VarChar(80)
+  entityType String   @map("entity_type") @db.VarChar(60)
+  entityId   String?  @map("entity_id") @db.VarChar(120)
+  meta       Json?
+  ip         String?  @db.VarChar(64)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  admin AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@map("admin_logs")
+}
